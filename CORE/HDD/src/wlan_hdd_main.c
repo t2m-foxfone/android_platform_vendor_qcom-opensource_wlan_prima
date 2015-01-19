@@ -8615,6 +8615,218 @@ static eHalStatus hdd_11d_scan_done(tHalHandle halHandle, void *pContext,
     return eHAL_STATUS_SUCCESS;
 }
 
+//[BUGFIX]-ADD-BEGIN by TCTNB.ZhangJie,05/13/2013,452131,
+//Enable wifi mac address
+//JRD function.
+/* FIXME:hard code.
+ * filename: /data/param/macaddr
+ * 	this file will be updated by tool [nvcmd] when boot-up.
+ * 	refer to script [init.rc].
+ * string format: [00:12:34:AB:cd:ef]
+ * 	with hex value.
+ * */
+#define MAC_LEN		6
+#define MAC_STR_LEN	17
+#define MAC_CHAR_NUM	2
+#define MMCBLKP     "/dev/block/platform/msm_sdcc.1/by-name/traceability"
+#define WLANFILE   "/data/param/macaddr"
+#define WLAN_OFFSET 57
+static inline int is_in_range(unsigned char c,
+		unsigned char low, unsigned char high)
+{
+	if((c > high) || (c < low)){
+		return 0;
+	}else{
+		return 1;
+	}
+}
+
+//convert a hex string to long integer.
+static int hex_strtol(const char *p)
+{
+	int i;
+	int acc = 0;
+	unsigned char c;
+
+	for(i=0; i<MAC_CHAR_NUM; i++){
+		c = (unsigned char)(p[i]);
+		if (is_in_range(c, '0', '9'))
+			c -= '0';
+		else if (is_in_range(c, 'a', 'f'))
+			c -= ('a' - 10);
+		else if (is_in_range(c, 'A', 'F'))
+			c -= ('A' - 10);
+		else
+			break;
+
+		acc = (acc << 4) + c;
+	}
+
+	return acc;
+}
+
+static int str2wa(const char *str, unsigned char *wa)
+{
+	unsigned char tmp[6];
+	int l;
+	const char *ptr = str;
+	int i;
+	int result = 0;
+
+	for (i = 0; i < MAC_LEN; i++) {
+		l = hex_strtol(ptr);
+		if((l > 255) || (l < 0)){
+			result = -1;
+			break;
+		}
+
+		tmp[i] = (unsigned char)l;
+
+		if(i == MAC_LEN - 1){
+			break; //done
+		}
+
+		ptr = strchr(ptr, ':');
+		if(ptr == NULL){
+			result = -1;
+			break;
+		}
+		ptr++;
+	}
+
+	if(result == 0){
+		memcpy((char *)wa, (char*)(&tmp), MAC_LEN);
+	}
+
+	return result;
+}
+
+static int jrd_get_mac_addr(unsigned char *eaddr)
+{
+	struct file *fp = NULL;
+	char fn[100] = {0};
+	char dp[MAC_STR_LEN + 1] = {0};
+	int l,len;
+	loff_t pos;
+	mm_segment_t old_fs;
+	//FIXME:hard code.
+	strcpy(fn, "/data/param/macaddr");
+	fp = filp_open(fn, O_RDONLY, 0);
+	if(IS_ERR(fp)){
+		printk(KERN_INFO "Unable to open '%s'.\n", fn);
+		goto err_open;
+	}
+
+	l = fp->f_path.dentry->d_inode->i_size;
+	if(l < MAC_STR_LEN){
+		printk(KERN_INFO "Invalid macaddr file '%s' %d\n", fn,l);
+		goto err_format;
+	}
+
+	pos = 0;
+	old_fs=get_fs();
+	set_fs(KERNEL_DS);
+	len=vfs_read(fp, dp, MAC_STR_LEN, &pos);
+	set_fs(old_fs);
+	if(len!= MAC_STR_LEN)
+	{
+		printk(KERN_INFO "Failed to read '%s'  %d  %s.\n", fn,len,dp );
+		goto err_format;
+	}
+
+	dp[MAC_STR_LEN] = '\0';
+	str2wa(dp, eaddr);
+
+	filp_close(fp, NULL);
+	return 0;
+
+err_format:
+	filp_close(fp, NULL);
+err_open:
+	return -1;
+}
+//[BUGFIX]-Add-BEGIN by TCTNB.xiaomanwang,08/14/2014,760647,
+//set default bt/wifi mac if trace is NULL
+//restore mac addr to traceabillity and /data/param/macaddr
+static int write_trace_partition(char* data, size_t nlen,size_t offset) {
+	struct file *fp = NULL;
+    int len;
+    loff_t pos;
+    mm_segment_t old_fs;
+	char buf[512];
+
+ 
+    fp = filp_open(MMCBLKP, O_RDWR,0);
+    if(IS_ERR(fp)){
+    pr_info("write_trace: Unable to open '%s'.\n", MMCBLKP);
+    return -1;
+    }
+
+    pr_info("write_trace_partition Begin \n");
+    memset(buf, 0, sizeof(buf));
+    
+    //read traceability
+   pos = 0;
+   old_fs=get_fs();
+   set_fs(KERNEL_DS);
+   len=vfs_read(fp, buf, 512, &pos);
+   if(len!= 512)
+   {
+    pr_info("write_trace: Failed to read '%s'  %d  %s.\n", MMCBLKP,len,buf );
+    filp_close(fp, NULL);
+    return -1;
+   }
+   set_fs(old_fs);
+   filp_close(fp, NULL);
+
+   memcpy(&buf[offset], data, nlen);
+   
+   fp = filp_open(MMCBLKP, O_RDWR,0);
+   pos = 0;
+   old_fs=get_fs();
+   set_fs(KERNEL_DS);
+   len = vfs_write(fp,buf,512,&pos);
+   if(len!= 512)
+   {
+     pr_info("write_trace: Failed to write '%s'  %d  %s.\n", MMCBLKP,len,buf );
+     filp_close(fp, NULL);
+     return -1;
+   }
+   set_fs(old_fs);
+   filp_close(fp, NULL);
+
+   memset(buf,0,sizeof(512));
+   sprintf(buf, "%02x%02x%02x%02x%02x%02x",
+            data[5], data[4], data[3],
+            data[2], data[1], data[0]);
+    
+   fp = filp_open(WLANFILE, O_RDWR | O_CREAT,0);
+   if(IS_ERR(fp)){
+     printk(KERN_INFO "Unable to open '%s'.\n", MMCBLKP);
+     return -1;
+  }
+
+  pos = 0;
+  old_fs=get_fs();
+  set_fs(KERNEL_DS);
+  len=vfs_write(fp, buf, strlen(buf), &pos);
+  set_fs(old_fs);
+  if(len!= strlen(buf))
+  {
+    printk(KERN_INFO "Failed to read '%s'  %d  %s.\n", WLANFILE,len,buf );
+    filp_close(fp, NULL);
+    return -1;
+  }
+     
+  filp_close(fp, NULL);
+
+  pr_info("write_trace_partition End \n");
+  return 0;
+}
+//[BUGFIX]-Add-END by TCTNB.xiaomanwang
+
+//[BUGFIX]-ADD-END by TCTNB.ZhangJie
+
 /**---------------------------------------------------------------------------
 
   \brief hdd_wlan_startup() - HDD init function
@@ -8642,7 +8854,10 @@ int hdd_wlan_startup(struct device *dev )
    int ret;
    struct wiphy *wiphy;
    v_MACADDR_t mac_addr;
-
+//[BUGFIX]-ADD-BEGIN by TCTNB.ZhangJie,05/13/2013,452131,
+//Enable wifi mac address
+   static unsigned char nv_mac[6];
+//[BUGFIX]-ADD-END by TCTNB.ZhangJie
    ENTER();
    /*
     * cfg80211: wiphy allocation
@@ -8965,7 +9180,7 @@ int hdd_wlan_startup(struct device *dev )
 
       static const v_MACADDR_t default_address =
          {{0x00, 0x0A, 0xF5, 0x89, 0x89, 0xFF}};
-
+#if 0  //[BUGFIX]-Add-BEGIN by TCTNB.xiaomanwang,08/14/2014,760647
       if (0 == memcmp(&default_address, &pHddCtx->cfg_ini->intfMacAddr[0],
                    sizeof(default_address)))
       {
@@ -8985,13 +9200,79 @@ int hdd_wlan_startup(struct device *dev )
          }
       }
       else
-#endif //WLAN_AUTOGEN_MACADDR_FEATURE
       {
          hddLog(VOS_TRACE_LEVEL_ERROR,
                 "%s: Invalid MAC address in NV, using MAC from ini file "
                 MAC_ADDRESS_STR, __func__,
                 MAC_ADDR_ARRAY(pHddCtx->cfg_ini->intfMacAddr[0].bytes));
       }
+#endif  //[BUGFIX]-Add-BEGIN by TCTNB.xiaomanwang,08/14/2014,760647
+        ret = jrd_get_mac_addr(nv_mac);
+
+        if ((ret==-1) || (nv_mac[0]==0x00 && nv_mac[1]==0x00 && nv_mac[2]==0x00)) {
+			unsigned int serialno;
+			int i;
+			serialno = wcnss_get_serial_number();
+      		if ((0 != serialno) &&
+          		(0 == memcmp(&default_address, &pHddCtx->cfg_ini->intfMacAddr[0],
+                       		sizeof(default_address))))
+      		{
+         		/* cfg.ini has the default address, invoke autogen logic */
+
+         		/* MAC address has 3 bytes of OUI so we have a maximum of 3
+            		bytes of the serial number that can be used to generate
+            		the other 3 bytes of the MAC address.  Mask off all but
+            		the lower 3 bytes (this will also make sure we don't
+            		overflow in the next step) */
+         		serialno &= 0x00FFFFFF;
+
+         		/* we need a unique address for each session */
+         		serialno *= VOS_MAX_CONCURRENCY_PERSONA;
+
+         		/* autogen all addresses */
+         		for (i = 0; i < VOS_MAX_CONCURRENCY_PERSONA; i++)
+         		{
+            		/* start with the entire default address */
+            		pHddCtx->cfg_ini->intfMacAddr[i] = default_address;
+            		/* then replace the lower 3 bytes */
+            		pHddCtx->cfg_ini->intfMacAddr[i].bytes[3] = (serialno >> 16) & 0xFF;
+            		pHddCtx->cfg_ini->intfMacAddr[i].bytes[4] = (serialno >> 8) & 0xFF;
+            		pHddCtx->cfg_ini->intfMacAddr[i].bytes[5] = serialno & 0xFF;
+
+            		serialno++;
+         		}
+
+               //[BUGFIX]-Add-BEGIN by TCTNB.xiaomanwang,08/14/2014,760647,
+               //set default bt/wifi mac if trace is NULL
+                nv_mac[0] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[0];
+                nv_mac[1] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[1];
+                nv_mac[2] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[2];
+                nv_mac[3] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[3];
+                nv_mac[4] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[4];
+                nv_mac[5] = pHddCtx->cfg_ini->intfMacAddr[0].bytes[5];
+   
+                pr_info("enter write trace partition \n");
+                write_trace_partition(nv_mac,6,WLAN_OFFSET);
+
+               //[BUGFIX]-Add-END by TCTNB.xiaomanwang
+         		pr_info("wlan: Invalid MAC addresses in NV, autogenerated "
+                		MAC_ADDRESS_STR,
+                		MAC_ADDR_ARRAY(pHddCtx->cfg_ini->intfMacAddr[0].bytes));
+      		}
+		} else {
+                /* start with the entire default address */
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[0] = nv_mac[0];
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[1] = nv_mac[1];
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[2] = nv_mac[2];
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[3] = nv_mac[3];
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[4] = nv_mac[4];
+                pHddCtx->cfg_ini->intfMacAddr[0].bytes[5] = nv_mac[5];
+        }
+         pr_info("wlan: Invalid MAC addresses in NV, autogenerated "
+                MAC_ADDRESS_STR,
+                MAC_ADDR_ARRAY(pHddCtx->cfg_ini->intfMacAddr[0].bytes));
+#endif //WLAN_AUTOGEN_MACADDR_FEATURE
+//[BUGFIX]-ADD-END by TCTNB.ZhangJie
    }
    {
       eHalStatus halStatus;
